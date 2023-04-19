@@ -1,7 +1,9 @@
+use std::intrinsics::atomic_and_release;
 use std::marker::PhantomData;
+use std::mem::transmute;
 use std::ops::Index;
 use std::slice::SliceIndex;
-use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU8, AtomicUsize, Ordering};
 
 const CONTENTION_THRESHOLD: usize = 2;
 const RETRY_THRESHOLD: usize = 2;
@@ -25,28 +27,120 @@ impl ContentionMeasure {
     }
 }
 
-pub trait CasDescriptor {
-    fn execute(&self) -> Result<(), ()>;
+#[repr(u8)]
+enum CasState {
+    Success,
+    Failure,
+    Pending,
 }
 
-pub trait CasDescriptors<D>: Index<usize, Output=D>
-    where
-        D: CasDescriptor
+pub struct CasByRcu<T, M> {
+    version: u64,
+    value: T,
+    meta: M,
+}
+
+pub struct Atomic<T, M>(AtomicPtr<CasByRcu<T, M>>);
+
+pub trait VersionedCas {
+    fn execute(&self) -> bool;
+    fn has_modified_bit(&self) -> bool;
+    fn clear_bit(&self) -> bool;
+    fn state(&self) -> CasState;
+    fn set_state(&self, new: &CasState);
+}
+
+impl<T, M> Atomic<T, M>
+    where M: PartialEq + Eq
 {
-    fn len(&self) -> usize;
+    pub fn new(initial: T, meta: M) -> Self {
+        Self(AtomicPtr::new(Box::into_raw(Box::new(CasByRcu {
+            version: 0,
+            meta,
+            value: initial,
+        }))))
+    }
+
+    pub fn get2(&self) -> (&T, &M, u64) {
+        let this_ptr = self.get();
+        let this = unsafe { &*this_ptr };
+        (&this.value, &this.meta, this.version)
+
+    }
+    pub fn with<F, R>(&self, f: F) -> R where F: FnOnce(&T, &M) -> R {
+        let this_ptr = self.get();
+        let this = unsafe { &*this_ptr };
+        f(&this.value, &this.meta)
+
+    }
+
+    fn get(&self) -> *const CasByRcu<T, M> {
+        self.0.load(Ordering::SeqCst)
+    }
+
+
+    pub fn value(&self) -> &T {
+        // Safety: this is safe because we never deallocate
+        &unsafe { &*self.0.load(Ordering::SeqCst) }.value
+    }
+
+    pub fn meta(&self) -> &M {
+        // Safety: this is safe because we never deallocate
+        &unsafe { &*self.0.load(Ordering::SeqCst) }.meta
+    }
+
+    fn compare_and_set(&self, expected: &T, expected_meta: &M, new: T, new_meta: M) -> bool {
+        let this_ptr = self.0.load(Ordering::SeqCst);
+        let this = unsafe { &*this_ptr };
+        if this.value == expected && &this.meta == expected_meta {
+            if expected != new {
+                let _ = self.0.compare_exchange_weak(this_ptr,
+                                                     Box::into_raw(
+                                                         Box::new(CasByRcu {
+                                                             version: this.version + 1,
+                                                             meta: new_meta,
+                                                             value: new,
+                                                         })),
+                                                     Ordering::SeqCst, Ordering::SeqCst);
+                true
+            }
+        }
+        false
+    }
 }
 
+impl<T> VersionAtomic for Atomic<T> {
+    fn execute(&self) -> bool {
+        todo!()
+    }
+
+    fn has_modified_bit(&self) -> bool {
+        todo!()
+    }
+
+    fn clear_bit(&self) -> bool {
+        todo!()
+    }
+
+    fn state(&self) -> CasState {
+        todo!()
+    }
+
+    fn set_state(&self, new: &CasState) {
+        todo!()
+    }
+}
 
 // in bystander
 pub trait NormalizedLockFree {
     type Cas: CasDescriptor;
-    type Cases: CasDescriptors<Self::Cas> + Clone;
+    type CommitDescriptor: CasDescriptors<Self::Cas> + Clone;
     type Output: Clone;
     type Input: Clone;
 
 
-    fn generator(&self, op: &Self::Input, contention: &mut ContentionMeasure) -> Result<Self::Cases, Contention>;
-    fn wrap_up(&self, executed: Result<(), usize>, performed: &Self::Cases, contention: &mut ContentionMeasure) -> Result<Option<Self::Output>, Contention>;
+    fn generator(&self, op: &Self::Input, contention: &mut ContentionMeasure) -> Result<Self::CommitDescriptor, Contention>;
+    fn wrap_up(&self, executed: Result<(), usize>, performed: &Self::CommitDescriptor, contention: &mut ContentionMeasure) -> Result<Option<Self::Output>, Contention>;
 }
 
 struct OperationRecordBox<LF: NormalizedLockFree> {
@@ -55,16 +149,11 @@ struct OperationRecordBox<LF: NormalizedLockFree> {
 
 enum OperationState<LF: NormalizedLockFree> {
     PreCas,
-    ExecuteCas(LF::Cases),
-    PostCas(LF::Cases, Result<(), usize>),
+    ExecuteCas(LF::CommitDescriptor),
+    PostCas(LF::CommitDescriptor, Result<(), usize>),
     Completed(LF::Output),
 }
 
-// impl<LF: NormalizedLockFree> OperationState<LF> {
-//     pub fn is_completed(&self) -> bool {
-//         matches!(self, Self::Completed(..))
-//     }
-// }
 
 struct OperationRecord<LF: NormalizedLockFree> {
     owner: std::thread::ThreadId,
@@ -72,21 +161,6 @@ struct OperationRecord<LF: NormalizedLockFree> {
     input: LF::Input,
 }
 
-// impl<LF: NormalizedLockFree> Clone for OperationRecord<LF>
-//     where
-//         LF::Input: Clone,
-//         LF::Output: Clone,
-//         LF::Cases: Clone
-// {
-//     fn clone(&self) -> Self {
-//         Self {
-//             owner: self.owner.clone(),
-//             input: self.input.clone(),
-//             state: self.state.clone(),
-//             cas_list: self.cas_list.clone(),
-//         }
-//     }
-// }
 
 // A wait-free queue
 pub struct HelpQueue<LF> {
@@ -112,23 +186,25 @@ pub struct WaitFreeSimulator<LF: NormalizedLockFree> {
 
 
 impl<LF: NormalizedLockFree> WaitFreeSimulator<LF>
+    where
+            for<'a> &'a LF::CommitDescriptor: IntoIterator<Item=&'a dyn VersionAtomic>
 {
-    fn help_first(&self) {
-        if let Some(help) = self.help.peek() {
-            self.help_op(unsafe { &*help })
-        }
-    }
-
-    fn cas_executor(&self, descriptors: &LF::Cases, content: &mut ContentionMeasure) -> Result<(), usize> {
+    fn cas_executor(&self, descriptors: &LF::CommitDescriptor, content: &mut ContentionMeasure) -> Result<(), usize> {
         let len = descriptors.len();
-        for i in 0..len {
+        for (i, cas) in descriptors.into_iter().enumerate() {
             // TODO: Check if already complete
-            if descriptors[i].execute().is_err() {
+            if cas.execute().is_err() {
                 content.detected();
                 return Err(i);
             }
         }
         Ok(())
+    }
+
+    fn help_first(&self) {
+        if let Some(help) = self.help.peek() {
+            self.help_op(unsafe { &*help })
+        }
     }
 
     // Guarantees that on return, orb is no longer in help queue
