@@ -1,13 +1,14 @@
-use std::intrinsics::atomic_and_release;
-use std::marker::PhantomData;
-use std::mem::transmute;
-use std::ops::Index;
-use std::slice::SliceIndex;
-use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU8, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicPtr, Ordering};
+
+use crate::help_queue::HelpQueue;
+
+mod help_queue;
 
 const CONTENTION_THRESHOLD: usize = 2;
 const RETRY_THRESHOLD: usize = 2;
 
+#[derive(Debug)]
 pub struct Contention;
 
 pub struct ContentionMeasure(usize);
@@ -28,88 +29,106 @@ impl ContentionMeasure {
 }
 
 #[repr(u8)]
-enum CasState {
+#[derive(Eq, PartialEq)]
+pub enum CasState {
     Success,
     Failure,
     Pending,
 }
 
-pub struct CasByRcu<T, M> {
+pub struct CasByRcu<T> {
     version: u64,
     value: T,
-    meta: M,
 }
 
-pub struct Atomic<T, M>(AtomicPtr<CasByRcu<T, M>>);
+pub struct Atomic<T>(AtomicPtr<CasByRcu<T>>);
 
 pub trait VersionedCas {
-    fn execute(&self) -> bool;
+    fn execute(&self, contention: &mut ContentionMeasure) -> Result<bool, Contention>;
     fn has_modified_bit(&self) -> bool;
     fn clear_bit(&self) -> bool;
     fn state(&self) -> CasState;
-    fn set_state(&self, new: &CasState);
+    fn set_state(&self, new: CasState);
 }
 
-impl<T, M> Atomic<T, M>
-    where M: PartialEq + Eq
+impl<T> Atomic<T>
+    where
+        T: Eq + PartialEq
 {
-    pub fn new(initial: T, meta: M) -> Self {
+    pub fn new(initial: T) -> Self {
         Self(AtomicPtr::new(Box::into_raw(Box::new(CasByRcu {
             version: 0,
-            meta,
             value: initial,
         }))))
     }
 
-    pub fn get2(&self) -> (&T, &M, u64) {
+    pub fn get2(&self) -> (&T, u64) {
         let this_ptr = self.get();
         let this = unsafe { &*this_ptr };
-        (&this.value, &this.meta, this.version)
-
+        (&this.value, this.version)
     }
-    pub fn with<F, R>(&self, f: F) -> R where F: FnOnce(&T, &M) -> R {
+    pub fn with<F, R>(&self, f: F) -> R where F: FnOnce(&T, u64) -> R {
         let this_ptr = self.get();
         let this = unsafe { &*this_ptr };
-        f(&this.value, &this.meta)
-
+        f(&this.value, this.version)
     }
 
-    fn get(&self) -> *const CasByRcu<T, M> {
+    fn get(&self) -> *mut CasByRcu<T> {
         self.0.load(Ordering::SeqCst)
     }
 
+    fn _set(&self, value: T) {
+        let this_ptr = self.get() as *mut CasByRcu<T>;
+        let this = unsafe { &*this_ptr };
+        if this.value != value {
+            let _ = self.0.store(
+                Box::into_raw(
+                    Box::new(CasByRcu {
+                        version: this.version + 1,
+                        value,
+                    })),
+                Ordering::SeqCst);
+        }
+    }
 
     pub fn value(&self) -> &T {
         // Safety: this is safe because we never deallocate
         &unsafe { &*self.0.load(Ordering::SeqCst) }.value
     }
 
-    pub fn meta(&self) -> &M {
-        // Safety: this is safe because we never deallocate
-        &unsafe { &*self.0.load(Ordering::SeqCst) }.meta
-    }
-
-    fn compare_and_set(&self, expected: &T, expected_meta: &M, new: T, new_meta: M) -> bool {
-        let this_ptr = self.0.load(Ordering::SeqCst);
+    pub fn compare_and_set(&self, expected: &T, value: T, contention: &mut ContentionMeasure, version: Option<u64>) -> Result<bool, Contention> {
+        let this_ptr = self.get();
         let this = unsafe { &*this_ptr };
-        if this.value == expected && &this.meta == expected_meta {
-            if expected != new {
-                let _ = self.0.compare_exchange_weak(this_ptr,
-                                                     Box::into_raw(
-                                                         Box::new(CasByRcu {
-                                                             version: this.version + 1,
-                                                             meta: new_meta,
-                                                             value: new,
-                                                         })),
-                                                     Ordering::SeqCst, Ordering::SeqCst);
-                true
+        if &this.value == expected {
+            if let Some(v) = version {
+                if v != this.version {
+                    contention.detected()?;
+                    return Ok(false);
+                }
             }
+            if expected != &value {
+                let new = Box::into_raw(
+                    Box::new(CasByRcu {
+                        version: this.version + 1,
+                        value,
+                    }));
+                return match self.0.compare_exchange(this_ptr,
+                                                     new,
+                                                     Ordering::SeqCst, Ordering::Relaxed) {
+                    Ok(_) => Ok(true),
+                    Err(_) => {
+                        // Safety: the Box was never shared
+                        let _ = unsafe { Box::from_raw(new) };
+                        contention.detected()?;
+                        Ok(false)
+                    }
+                };
+            }
+            return Ok(true);
         }
-        false
+        Ok(false)
     }
-}
 
-impl<T> VersionAtomic for Atomic<T> {
     fn execute(&self) -> bool {
         todo!()
     }
@@ -126,24 +145,25 @@ impl<T> VersionAtomic for Atomic<T> {
         todo!()
     }
 
-    fn set_state(&self, new: &CasState) {
+    fn set_state(&self, _new: &CasState) {
         todo!()
     }
 }
 
+
 // in bystander
 pub trait NormalizedLockFree {
-    type Cas: CasDescriptor;
-    type CommitDescriptor: CasDescriptors<Self::Cas> + Clone;
+    type CommitDescriptor: Clone;
     type Output: Clone;
     type Input: Clone;
 
 
     fn generator(&self, op: &Self::Input, contention: &mut ContentionMeasure) -> Result<Self::CommitDescriptor, Contention>;
     fn wrap_up(&self, executed: Result<(), usize>, performed: &Self::CommitDescriptor, contention: &mut ContentionMeasure) -> Result<Option<Self::Output>, Contention>;
+    fn fast_path(&self, op: &Self::Input, contention: &mut ContentionMeasure) -> Result<Self::Output, Contention>;
 }
 
-struct OperationRecordBox<LF: NormalizedLockFree> {
+pub struct OperationRecordBox<LF: NormalizedLockFree> {
     val: AtomicPtr<OperationRecord<LF>>,
 }
 
@@ -161,48 +181,95 @@ struct OperationRecord<LF: NormalizedLockFree> {
     input: LF::Input,
 }
 
-
-// A wait-free queue
-pub struct HelpQueue<LF> {
-    _o: PhantomData<LF>,
-}
-
-impl<LF: NormalizedLockFree> HelpQueue<LF> {
-    fn enqueue(&self, help: *const OperationRecordBox<LF>) {}
-
-    fn peek(&self) -> Option<*const OperationRecordBox<LF>> {
-        None
-    }
-
-    fn try_remove_front(&self, completed: *const OperationRecordBox<LF>) -> Result<(), ()> {
-        Err(())
-    }
-}
-
-pub struct WaitFreeSimulator<LF: NormalizedLockFree> {
+struct Shared<LF: NormalizedLockFree, const N: usize> {
     algorithm: LF,
-    help: HelpQueue<LF>,
+    help: HelpQueue<LF, N>,
+    free_ids: Mutex<Vec<usize>>,
+}
+
+pub struct TooManyHandles;
+
+pub struct WaitFreeSimulator<LF: NormalizedLockFree, const N: usize> {
+    shared: Arc<Shared<LF, N>>,
+
+    id: usize,
+}
+
+impl<LF: NormalizedLockFree, const N: usize> WaitFreeSimulator<LF, N> {
+    pub fn new(algorithm: LF) -> Self {
+        assert_ne!(N, 0);
+        Self {
+            shared: Arc::new(Shared {
+                algorithm,
+                help: HelpQueue::new(),
+                free_ids: Mutex::new((1..N).collect())
+            }),
+            id: 0
+        }
+    }
+
+    pub fn fork(&self) -> Result<Self, TooManyHandles> {
+        if let Some(id) = self.shared.free_ids.lock().unwrap().pop() {
+            Ok(Self {
+                shared: Arc::clone(&self.shared),
+                id,
+            })
+        } else {
+            Err(TooManyHandles)
+        }
+    }
+}
+
+impl<LF: NormalizedLockFree, const N: usize> Drop for WaitFreeSimulator<LF, N> {
+    fn drop(&mut self) {
+        self.shared.free_ids.lock().unwrap().push(self.id)
+    }
 }
 
 
-impl<LF: NormalizedLockFree> WaitFreeSimulator<LF>
+pub enum CasExecutionFailure {
+    CasFailed(usize),
+    Contention,
+}
+
+impl From<Contention> for CasExecutionFailure {
+    fn from(_value: Contention) -> Self {
+        Self::Contention
+    }
+}
+
+
+impl<LF: NormalizedLockFree, const N: usize> WaitFreeSimulator<LF, N>
     where
-            for<'a> &'a LF::CommitDescriptor: IntoIterator<Item=&'a dyn VersionAtomic>
+            for<'a> &'a LF::CommitDescriptor: IntoIterator<Item=&'a dyn VersionedCas>
 {
-    fn cas_executor(&self, descriptors: &LF::CommitDescriptor, content: &mut ContentionMeasure) -> Result<(), usize> {
-        let len = descriptors.len();
+    pub fn cas_executor(&self, descriptors: &LF::CommitDescriptor, contention: &mut ContentionMeasure) -> Result<(), CasExecutionFailure> {
         for (i, cas) in descriptors.into_iter().enumerate() {
-            // TODO: Check if already complete
-            if cas.execute().is_err() {
-                content.detected();
-                return Err(i);
+            match cas.state() {
+                CasState::Success => {
+                    cas.clear_bit();
+                }
+                CasState::Failure => {
+                    return Err(CasExecutionFailure::CasFailed(i));
+                }
+                CasState::Pending => {
+                    cas.execute(contention)?;
+                    if cas.has_modified_bit() {
+                        cas.set_state(CasState::Success);
+                        cas.clear_bit();
+                    }
+                    if cas.state() != CasState::Success {
+                        cas.set_state(CasState::Failure);
+                        return Err(CasExecutionFailure::CasFailed(i));
+                    }
+                }
             }
         }
         Ok(())
     }
 
     fn help_first(&self) {
-        if let Some(help) = self.help.peek() {
+        if let Some(help) = self.shared.help.peek() {
             self.help_op(unsafe { &*help })
         }
     }
@@ -213,13 +280,13 @@ impl<LF: NormalizedLockFree> WaitFreeSimulator<LF>
             let or = unsafe { &*orb.val.load(Ordering::SeqCst) };
             let updated_or = match &or.state {
                 OperationState::Completed(..) => {
-                    let _ = self.help.try_remove_front(orb);
+                    let _ = self.shared.help.try_remove_front(orb);
                     return;
                 }
                 OperationState::PreCas => {
-                    let cas_list = match self.algorithm.generator(&or.input, &mut ContentionMeasure(0)) {
+                    let cas_list = match self.shared.algorithm.generator(&or.input, &mut ContentionMeasure(0)) {
                         Ok(cas_list) => cas_list,
-                        Err(Contention) => {
+                        Err(_) => {
                             continue;
                         }
                     };
@@ -230,7 +297,11 @@ impl<LF: NormalizedLockFree> WaitFreeSimulator<LF>
                     })
                 }
                 OperationState::ExecuteCas(cas_list) => {
-                    let outcome = self.cas_executor(cas_list, &mut ContentionMeasure(0));
+                    let outcome = match self.cas_executor(cas_list, &mut ContentionMeasure(0)) {
+                        Ok(outcome) => Ok(outcome),
+                        Err(CasExecutionFailure::CasFailed(i)) => Err(i),
+                        Err(_) => continue
+                    };
                     Box::new(OperationRecord {
                         owner: or.owner.clone(),
                         state: OperationState::PostCas(cas_list.clone(), outcome),
@@ -238,7 +309,7 @@ impl<LF: NormalizedLockFree> WaitFreeSimulator<LF>
                     })
                 }
                 OperationState::PostCas(cas_list, outcome) => {
-                    match self.algorithm.wrap_up(*outcome, cas_list, &mut ContentionMeasure(0)) {
+                    match self.shared.algorithm.wrap_up(*outcome, cas_list, &mut ContentionMeasure(0)) {
                         Ok(Some(result)) => {
                             Box::new(OperationRecord {
                                 owner: or.owner.clone(),
@@ -269,27 +340,34 @@ impl<LF: NormalizedLockFree> WaitFreeSimulator<LF>
     }
 
     pub fn run(&self, op: LF::Input) -> LF::Output {
+        let help = /* one in a while */ true;
+        if help {
+            self.help_first();
+        }
+
+        // slow path: ask for help
         for retry in 0.. {
-            let help = /* one in a while */ true;
-            if help {
-                self.help_first();
-            }
             let mut contention = ContentionMeasure(0);
-            let cases = self.algorithm.generator(&op, &mut contention);
-            if contention.use_slow_path() {
-                break;
-            }
-            let result = self.cas_executor(&cases, &mut contention);
-            if contention.use_slow_path() {
-                break;
-            }
-            match self.algorithm.wrap_up(result, &cases, &mut contention) {
-                Ok(outcome) => return outcome,
+
+            match self.shared.algorithm.fast_path(&op, &mut contention) {
+                Ok(result) => return result,
                 Err(_) => {}
             }
-            if contention.use_slow_path() {
-                break;
-            }
+
+            // let cases = match self.algorithm.generator(&op, &mut contention) {
+            //     Ok(cases) => cases,
+            //     Err(_) => break
+            // };
+            //
+            // let result = match self.cas_executor(&cases, &mut contention) {
+            //   Ok(result) => result,
+            //     Err(_) => continue
+            // };
+            // match self.algorithm.wrap_up(result, &cases, &mut contention) {
+            //     Ok(Some(outcome)) => return outcome,
+            //     Ok(None) => {}
+            //     Err(_) => break
+            // }
             if retry > RETRY_THRESHOLD {
                 break;
             }
@@ -303,7 +381,7 @@ impl<LF: NormalizedLockFree> WaitFreeSimulator<LF>
             })))
         };
 
-        self.help.enqueue(&orb);
+        self.shared.help.enqueue(self.id, &orb);
         // Safety: ???
 
         loop {
@@ -319,28 +397,5 @@ impl<LF: NormalizedLockFree> WaitFreeSimulator<LF>
     }
 }
 
-// in a consuming crate (wait-free-linked-list crate)
-// pub struct WaitFreeLinkedList<T> {
-//     simulator: WaitFreeSimulator<LockFreeLinkedList<T>>,
-// }
-//
-// struct LockFreeLinkedList<T> {
-//     t: T,
-// }
 
-// impl<T> NormalizedLockFree for LockFreeLinkedList<T> {}
-//
-// impl<T> WaitFreeLinkedList<T> {
-//     pub fn push_front(&mut self, t: T) {
-//         let i = self.simulator.run(Insert(t));
-//         self.simulator.wait_for(i)
-//     }
-// }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn it_works() {}
-}
